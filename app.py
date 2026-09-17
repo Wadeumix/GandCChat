@@ -1,50 +1,114 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
+import subprocess
+import time
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, render_template, request, redirect, url_for, abort, g, jsonify
 
 CDP_URL = os.environ.get("GCC_CHROME_CDP_URL", "http://localhost:9222")
+CHROME_LAUNCH_SCRIPT = Path(__file__).parent / "launch_gemini_chrome.sh"
+CHROME_BOOT_TIMEOUT_SEC = 20
+
+
+def _cdp_is_up() -> bool:
+    try:
+        with urllib.request.urlopen(f"{CDP_URL}/json/version", timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+
+def ensure_dedicated_chrome_running() -> dict:
+    """専用Chrome（デバッグポート付き）が起動しているか確認し、なければ起動する。
+
+    戻り値: {"ok": True, "launched": bool} または {"ok": False, "error": ...}
+    """
+    if _cdp_is_up():
+        return {"ok": True, "launched": False}
+
+    if not CHROME_LAUNCH_SCRIPT.exists():
+        return {"ok": False, "error": f"起動スクリプトが見つかりません: {CHROME_LAUNCH_SCRIPT}"}
+
+    try:
+        subprocess.Popen(
+            ["/bin/bash", str(CHROME_LAUNCH_SCRIPT)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"専用Chromeの起動に失敗しました: {exc}"}
+
+    deadline = time.monotonic() + CHROME_BOOT_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        if _cdp_is_up():
+            return {"ok": True, "launched": True}
+        time.sleep(0.5)
+
+    return {
+        "ok": False,
+        "error": "専用Chromeの起動を試みましたが、時間内にデバッグポートへ接続できませんでした。",
+    }
 
 
 def extract_latest_gemini_message() -> dict:
     """専用Chrome（デバッグポート接続）から、Geminiタブの最新のAI発言を抽出する。
 
-    戻り値: {"ok": True, "text": ..., "source_url": ...} または {"ok": False, "error": ...}
+    Chromeが起動していなければ自動で起動を試み、Geminiタブが無ければ新規に開く。
+    戻り値: {"ok": True, "text": ..., "source_url": ..., "launched": bool, "opened_new_tab": bool}
+           または {"ok": False, "error": ...}
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return {"ok": False, "error": "playwrightがインストールされていません（pip install playwright）"}
 
+    boot = ensure_dedicated_chrome_running()
+    if not boot["ok"]:
+        return boot
+    launched = boot["launched"]
+
     try:
         with sync_playwright() as p:
             try:
                 browser = p.chromium.connect_over_cdp(CDP_URL)
-            except Exception:
-                return {
-                    "ok": False,
-                    "error": (
-                        "専用Chromeに接続できません。launch_gemini_chrome.sh で"
-                        "デバッグポート付きのChromeを起動してから試してください。"
-                    ),
-                }
-            gemini_pages = [
-                pg for ctx in browser.contexts for pg in ctx.pages if "gemini.google.com" in pg.url
-            ]
-            if not gemini_pages:
-                browser.close()
-                return {"ok": False, "error": "Geminiのタブが見つかりません。専用Chromeでgemini.google.comを開いてください。"}
+            except Exception as exc:
+                return {"ok": False, "error": f"専用Chromeへの接続に失敗しました: {exc}"}
 
-            page = gemini_pages[0]
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            gemini_pages = [pg for pg in ctx.pages if "gemini.google.com" in pg.url]
+
+            opened_new_tab = False
+            if not gemini_pages:
+                page = ctx.new_page()
+                page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=15000)
+                opened_new_tab = True
+            else:
+                page = gemini_pages[0]
+
+            # Angular製の会話画面はdomcontentloaded後もハイドレーションに時間がかかるため、
+            # 実際に発言ブロックが現れるまで待つ（無ければタイムアウトして先に進む）。
+            try:
+                page.wait_for_selector("model-response", timeout=8000)
+            except Exception:
+                pass
+
             model_msgs = page.query_selector_all("model-response")
             if not model_msgs:
                 browser.close()
-                return {"ok": False, "error": "AI発言のブロックが見つかりませんでした。ページ構造が変わった可能性があります。"}
+                hint = (
+                    "Chromeを起動したばかりです。Geminiにログイン済みか、会話が開かれているか確認してから、"
+                    "もう一度お試しください。"
+                    if (launched or opened_new_tab)
+                    else "AI発言のブロックが見つかりませんでした。ページ構造が変わった可能性があります。"
+                )
+                return {"ok": False, "error": hint}
 
             last = model_msgs[-1]
             content = last.query_selector("message-content")
@@ -54,7 +118,13 @@ def extract_latest_gemini_message() -> dict:
 
             if not text:
                 return {"ok": False, "error": "抽出したテキストが空でした。"}
-            return {"ok": True, "text": text, "source_url": source_url}
+            return {
+                "ok": True,
+                "text": text,
+                "source_url": source_url,
+                "launched": launched,
+                "opened_new_tab": opened_new_tab,
+            }
     except Exception as exc:
         return {"ok": False, "error": f"抽出中にエラーが発生しました: {exc}"}
 
