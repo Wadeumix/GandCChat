@@ -275,6 +275,51 @@
     font-size: 12.5px;
     cursor: pointer;
   }
+  .import-tabs {
+    display: flex;
+    gap: 16px;
+    margin-top: 8px;
+    font-size: 12px;
+  }
+  #import-share-pdf {
+    display: block;
+    margin-top: 8px;
+    font-size: 12.5px;
+  }
+
+  #onboarding-steps {
+    display: none;
+    gap: 8px;
+    padding: 10px 16px 0;
+    font-size: 11.5px;
+    color: var(--text-muted);
+  }
+  #onboarding-steps.show { display: flex; }
+  #onboarding-steps .step {
+    padding: 4px 10px;
+    border-radius: 12px;
+    background: #eceff1;
+  }
+  #onboarding-steps .step.done { background: #d7f2dd; color: #1b5e20; }
+  #onboarding-steps .step.current { background: #fff3cd; color: #7a5b00; font-weight: 600; }
+
+  #import-required-banner {
+    margin: 8px 16px 0;
+    padding: 10px 14px;
+    background: #fff3cd;
+    color: #7a5b00;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+
+  #chat.locked, #composer.locked {
+    opacity: 0.4;
+    pointer-events: none;
+  }
+  #capture-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
   #chat {
     flex: 1;
     overflow-y: auto;
@@ -589,13 +634,14 @@
 
 <div id="main">
   {% if current_room %}
+    {% set import_required = current_room.link_requested and not current_room.import_done %}
     <header>
       <div>
         # {{ current_room.name }}
         <small>Gemini（ブラウザAI）と Claude Code の会話ログ — 送信は常に手動コピペ</small>
       </div>
       <div class="header-actions">
-        <button id="capture-btn" type="button" data-room-id="{{ current_room.id }}">⬇ Geminiから取り込む</button>
+        <button id="capture-btn" type="button" data-room-id="{{ current_room.id }}" {% if import_required %}disabled{% endif %}>⬇ Geminiから取り込む</button>
         <button id="handoff-btn" type="button" data-room-id="{{ current_room.id }}">🔗 Claude Codeとリンク</button>
       </div>
     </header>
@@ -603,7 +649,19 @@
     <div id="capture-status"></div>
     <div id="handoff-status"></div>
 
-    <div id="chat">
+    <div id="onboarding-steps" class="{{ 'show' if import_required else '' }}">
+      <div class="step done">① Claude Codeとリンク済み</div>
+      <div class="step current">② 導入前の会話をインポート（必須）</div>
+      <div class="step">③ 会話開始</div>
+    </div>
+
+    {% if import_required %}
+      <div id="import-required-banner">
+        Claude Codeとのリンクが完了しました。会話を始める前に、導入前の文脈をインポートしてください（下のフォームから）。
+      </div>
+    {% endif %}
+
+    <div id="chat" class="{{ 'locked' if import_required else '' }}">
       {% if not messages %}
         <div class="empty">まだ会話がありません。下のフォームから発言を追加してください。</div>
       {% endif %}
@@ -621,13 +679,18 @@
       {% endfor %}
     </div>
 
-    <details id="import-share-box">
-      <summary>GCC導入前の会話をインポート（共有ページの全文を貼り付け）</summary>
-      <textarea id="import-share-text" placeholder="Gemini等の共有ページを開いて全文コピーし、ここに貼り付けてください"></textarea>
+    <details id="import-share-box" {% if import_required %}open{% endif %}>
+      <summary>{{ 'GCC導入前の会話をインポート（必須）' if import_required else 'GCC導入前の会話をインポート（共有ページをPDF保存 または 全文貼り付け）' }}</summary>
+      <div class="import-tabs">
+        <label><input type="radio" name="import-mode" value="pdf" checked> PDFをアップロード（推奨）</label>
+        <label><input type="radio" name="import-mode" value="text"> テキストを貼り付け</label>
+      </div>
+      <input type="file" id="import-share-pdf" accept="application/pdf">
+      <textarea id="import-share-text" placeholder="Gemini等の共有ページを開いて全文コピーし、ここに貼り付けてください" style="display:none"></textarea>
       <button id="import-share-btn" type="button" data-room-id="{{ current_room.id }}">インポートする</button>
     </details>
 
-    <div id="composer">
+    <div id="composer" class="{{ 'locked' if import_required else '' }}">
       <form method="post" action="{{ url_for('add_message', room_id=current_room.id) }}" id="add-form">
         <div class="speaker-toggle">
           <label><input type="radio" name="speaker" value="Gemini" checked><span>Gemini の発言を貼り付け</span></label>
@@ -900,16 +963,36 @@
   });
 
   const importBtn = document.getElementById('import-share-btn');
+  const importPdfInput = document.getElementById('import-share-pdf');
+  const importTextarea = document.getElementById('import-share-text');
+  document.querySelectorAll('input[name="import-mode"]').forEach((radio) => {
+    radio.addEventListener('change', () => {
+      const isPdf = document.querySelector('input[name="import-mode"]:checked').value === 'pdf';
+      importPdfInput.style.display = isPdf ? 'block' : 'none';
+      importTextarea.style.display = isPdf ? 'none' : 'block';
+    });
+  });
+
   if (importBtn) {
     importBtn.addEventListener('click', async () => {
-      const textarea = document.getElementById('import-share-text');
-      const text = textarea.value.trim();
-      if (!text) return;
-      const res = await fetch(`/rooms/${importBtn.dataset.roomId}/import-share`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-      });
+      const mode = document.querySelector('input[name="import-mode"]:checked').value;
+      const roomId = importBtn.dataset.roomId;
+      let res;
+      if (mode === 'pdf') {
+        const file = importPdfInput.files[0];
+        if (!file) { alert('PDFファイルを選択してください'); return; }
+        const formData = new FormData();
+        formData.append('pdf', file);
+        res = await fetch(`/rooms/${roomId}/import-share`, { method: 'POST', body: formData });
+      } else {
+        const text = importTextarea.value.trim();
+        if (!text) return;
+        res = await fetch(`/rooms/${roomId}/import-share`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+      }
       const data = await res.json();
       if (data.ok) {
         location.reload();
@@ -940,6 +1023,9 @@
       if (handoffStatus.textContent) {
         handoffStatus.classList.add('show');
         setTimeout(() => handoffStatus.classList.remove('show'), 4000);
+      }
+      if (data.import_required) {
+        setTimeout(() => location.reload(), 600);
       }
     });
   }

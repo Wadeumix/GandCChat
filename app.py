@@ -214,6 +214,10 @@ def init_db() -> None:
         conn.execute("ALTER TABLE rooms ADD COLUMN last_gemini_url TEXT")
     if "explainer_sent" not in room_cols:
         conn.execute("ALTER TABLE rooms ADD COLUMN explainer_sent INTEGER NOT NULL DEFAULT 0")
+    if "link_requested" not in room_cols:
+        conn.execute("ALTER TABLE rooms ADD COLUMN link_requested INTEGER NOT NULL DEFAULT 0")
+    if "import_done" not in room_cols:
+        conn.execute("ALTER TABLE rooms ADD COLUMN import_done INTEGER NOT NULL DEFAULT 0")
 
     msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
     if "source_url" not in msg_cols:
@@ -382,6 +386,8 @@ def create_room():
 def add_message(room_id: int):
     db = get_db()
     room = get_room_or_404(db, room_id)
+    if room["link_requested"] and not room["import_done"]:
+        return redirect(url_for("room_view", room_id=room_id, import_required=1))
     speaker = request.form.get("speaker")
     body = request.form.get("body", "")
     if speaker in ("Gemini", "Claude") and body.strip():
@@ -473,13 +479,25 @@ def link_prompt(room_id: int):
     """
     db = get_db()
     room = get_room_or_404(db, room_id)
+    if not room["link_requested"]:
+        db.execute("UPDATE rooms SET link_requested = 1 WHERE id = ?", (room_id,))
+        db.commit()
+        room = get_room_or_404(db, room_id)
+
     log_path = room_log_path(room["slug"]).resolve()
     prompt = (
         f"G&C Chatというローカルログアプリの「{room['name']}」ルームの会話ログです。\n"
         f"以下のファイルを読んで、これまでの文脈を踏まえた上で続きを行ってください。\n\n"
         f"{log_path}\n"
     )
-    return jsonify({"ok": True, "prompt": prompt, "path": str(log_path)})
+    return jsonify(
+        {
+            "ok": True,
+            "prompt": prompt,
+            "path": str(log_path),
+            "import_required": bool(room["link_requested"]) and not bool(room["import_done"]),
+        }
+    )
 
 
 def do_capture(room_id: int, text: str, source_url: str | None, force: bool) -> tuple[dict, int]:
@@ -550,7 +568,11 @@ def capture_message(room_id: int):
 @app.route("/rooms/<int:room_id>/capture-now", methods=["POST"])
 def capture_now(room_id: int):
     """専用Chromeから今すぐGeminiの最新発言を抽出し、そのまま/captureのロジックに渡す。"""
-    get_room_or_404(get_db(), room_id)
+    room = get_room_or_404(get_db(), room_id)
+    if room["link_requested"] and not room["import_done"]:
+        return jsonify(
+            {"ok": False, "code": "import_required", "error": "先に導入前の会話をインポートしてください。"}
+        ), 409
     force = bool((request.get_json(silent=True) or {}).get("force"))
 
     extracted = extract_latest_gemini_message()
@@ -563,18 +585,31 @@ def capture_now(room_id: int):
 
 @app.route("/rooms/<int:room_id>/import-share", methods=["POST"])
 def import_share(room_id: int):
-    """GCC導入前の会話を、共有リンクの中身（貼り付けたテキスト）で一括インポートする。
+    """GCC導入前の会話を一括インポートする。PDF（共有ページを印刷保存したもの）を推奨。
 
     Gemini/claude.aiの共有ページはクライアント側で描画されるSPAのため、
-    サーバー側から自動取得しても中身が空になることが多い。
-    そのため確実性を優先し、ユーザーが共有ページを開いて全文コピペしたテキストを
-    そのまま「導入前の文脈」として1件にまとめて記録する。
+    サーバー側からの自動取得やコピペでは崩れる・失敗することがある。
+    共有ページを「PDFとして保存」した上でアップロードしてもらう方が、
+    テキスト抽出が安定する。テキスト直接貼り付けにも引き続き対応する。
     """
     db = get_db()
     room = get_room_or_404(db, room_id)
-    text = (request.get_json(silent=True) or {}).get("text", "").strip()
+
+    text = ""
+    pdf_file = request.files.get("pdf")
+    if pdf_file and pdf_file.filename:
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(pdf_file.stream)
+            text = "\n\n".join((page.extract_text() or "") for page in reader.pages).strip()
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"PDFの読み込みに失敗しました: {exc}"}), 400
+    else:
+        text = (request.form.get("text") or (request.get_json(silent=True) or {}).get("text") or "").strip()
+
     if not text:
-        return jsonify({"ok": False, "error": "インポートするテキストが空です"}), 400
+        return jsonify({"ok": False, "error": "インポートする内容が空です"}), 400
 
     timestamp = datetime.now().strftime(TIMESTAMP_FMT)
     body = "【GCC導入前の会話をインポート】\n\n" + text
@@ -583,6 +618,7 @@ def import_share(room_id: int):
         "VALUES (?, 'Gemini', ?, ?, 1)",
         (room_id, body, timestamp),
     )
+    db.execute("UPDATE rooms SET import_done = 1 WHERE id = ?", (room_id,))
     db.commit()
     append_to_room_log(room["name"], room["slug"], "Gemini", body, timestamp)
     return jsonify({"ok": True})
