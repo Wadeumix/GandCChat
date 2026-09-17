@@ -725,6 +725,26 @@
   const chat = document.getElementById('chat');
   if (chat) chat.scrollTop = chat.scrollHeight;
 
+  // 外部（リンクしたClaude Codeセッション等）からの投稿やmdログへの追記を
+  // 軽量ポーリングで検知し、増えていたら自動リロードする。常時ではなく数秒間隔。
+  {% if current_room %}
+  (function () {
+    const roomId = {{ current_room.id }};
+    let known = {{ messages|length }};
+    setInterval(async () => {
+      try {
+        const res = await fetch(`/rooms/${roomId}/status`);
+        const data = await res.json();
+        if (data.ok && data.message_count !== known) {
+          location.reload();
+        }
+      } catch {
+        // 通信エラーは無視して次回に任せる
+      }
+    }, 4000);
+  })();
+  {% endif %}
+
   const menu = document.getElementById('room-context-menu');
   const renameBtn = document.getElementById('ctx-rename');
   const deleteBtn = document.getElementById('ctx-delete');

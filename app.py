@@ -285,6 +285,53 @@ def append_to_room_log(room_name: str, slug: str, speaker: str, body: str, times
         f.write(entry)
 
 
+LOG_HEADING_RE = re.compile(
+    r"^## (?P<speaker>Gemini|Claude)（(?P<timestamp>[^）]+)）\s*$", re.MULTILINE
+)
+
+
+def sync_log_file_into_db(db: sqlite3.Connection, room: sqlite3.Row) -> None:
+    """外部（リンクしたClaude Codeセッションなど）がmdログに直接追記した内容をDBに取り込む。
+
+    リンクされたセッションはAPIの存在を知らず、渡されたファイルパスに直接
+    追記することが自然な挙動になるため、mdファイルを都度読み直して
+    DBに無いエントリだけを追加する形で同期する（mdが正、DBは追従）。
+    """
+    path = room_log_path(room["slug"])
+    if not path.exists():
+        return
+
+    text = path.read_text(encoding="utf-8")
+    matches = list(LOG_HEADING_RE.finditer(text))
+    entries = []
+    for i, m in enumerate(matches):
+        speaker = m.group("speaker")
+        timestamp = m.group("timestamp")
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        if body:
+            entries.append((speaker, timestamp, body))
+
+    existing = db.execute(
+        "SELECT speaker, created_at, body FROM messages WHERE room_id = ? ORDER BY id ASC",
+        (room["id"],),
+    ).fetchall()
+    existing_set = {(r["speaker"], r["created_at"], r["body"]) for r in existing}
+
+    new_entries = [e for e in entries if e not in existing_set]
+    if not new_entries:
+        return
+
+    for speaker, timestamp, body in new_entries:
+        db.execute(
+            "INSERT INTO messages (room_id, speaker, body, created_at, imported) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (room["id"], speaker, body, timestamp),
+        )
+    db.commit()
+
+
 def get_rooms(db: sqlite3.Connection):
     return db.execute(
         "SELECT * FROM rooms WHERE deleted_at IS NULL ORDER BY created_at ASC"
@@ -348,6 +395,7 @@ def room_view(room_id: int):
     rooms = get_rooms(db)
     archived_rooms = get_archived_rooms(db)
     current_room = get_room_or_404(db, room_id)
+    sync_log_file_into_db(db, current_room)
     messages = db.execute(
         "SELECT * FROM messages WHERE room_id = ? ORDER BY id ASC", (room_id,)
     ).fetchall()
@@ -399,6 +447,21 @@ def add_message(room_id: int):
         db.commit()
         append_to_room_log(room["name"], room["slug"], speaker, body, timestamp)
     return redirect(url_for("room_view", room_id=room_id))
+
+
+@app.route("/rooms/<int:room_id>/status", methods=["GET"])
+def room_status(room_id: int):
+    """外部から直接mdログに追記された内容を同期しつつ、現在のメッセージ件数を返す。
+
+    ブラウザ側の軽量ポーリングで使う（常時ではなく数秒間隔、DBはローカルなので負荷は無視できる）。
+    """
+    db = get_db()
+    room = get_room_or_404(db, room_id)
+    sync_log_file_into_db(db, room)
+    count = db.execute(
+        "SELECT COUNT(*) AS c FROM messages WHERE room_id = ?", (room_id,)
+    ).fetchone()["c"]
+    return jsonify({"ok": True, "message_count": count})
 
 
 @app.route("/rooms/<int:room_id>/rename", methods=["POST"])
@@ -485,10 +548,14 @@ def link_prompt(room_id: int):
         room = get_room_or_404(db, room_id)
 
     log_path = room_log_path(room["slug"]).resolve()
+    post_script = (BASE_DIR / "gcc_post.py").resolve()
     prompt = (
         f"G&C Chat（ローカルの会話中継アプリ）の「{room['name']}」ルームのログです。\n"
         f"以下のファイルを読んで、これまでの文脈を踏まえた上で続きを行ってください。\n\n"
-        f"{log_path}\n"
+        f"{log_path}\n\n"
+        f"応答をこのルームに記録するには、ログファイルに直接書き込むのではなく、"
+        f"以下のコマンドで標準入力から本文を渡してください（複数行・引用符もそのまま安全に扱えます）。\n\n"
+        f"echo \"ここに応答本文\" | python3 {post_script} --room-id {room['id']} --speaker Claude\n"
     )
     return jsonify(
         {
