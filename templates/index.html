@@ -68,6 +68,16 @@
     color: white;
     font-weight: 600;
   }
+  .room-rename-input {
+    width: 100%;
+    background: #1e1f22;
+    color: white;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 5px 7px;
+    font-size: 13.5px;
+    font-family: inherit;
+  }
   #new-room {
     padding: 10px 8px 14px;
     border-top: 1px solid #3a3d43;
@@ -239,6 +249,153 @@
     color: var(--text-muted);
     font-size: 14px;
   }
+
+  /* ---- 右クリックコンテキストメニュー ---- */
+  #room-context-menu {
+    position: fixed;
+    z-index: 1000;
+    background: #1e1f22;
+    border: 1px solid #3a3d43;
+    border-radius: 6px;
+    padding: 4px;
+    min-width: 140px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    display: none;
+  }
+  #room-context-menu button {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    color: #dcddde;
+    padding: 7px 10px;
+    font-size: 13px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  #room-context-menu button:hover {
+    background: #3a3d43;
+  }
+  #room-context-menu button.danger {
+    color: #f23f42;
+  }
+  #room-context-menu button.danger:hover {
+    background: rgba(242, 63, 66, 0.15);
+  }
+
+  /* ---- 確認モーダル ---- */
+  #confirm-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.4);
+    z-index: 2000;
+    align-items: center;
+    justify-content: center;
+  }
+  #confirm-modal .box {
+    background: white;
+    border-radius: 10px;
+    padding: 20px;
+    width: 320px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  }
+  #confirm-modal p {
+    margin: 0 0 16px;
+    font-size: 14px;
+    line-height: 1.6;
+    color: #222;
+  }
+  #confirm-modal .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  #confirm-modal button {
+    border: none;
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #confirm-cancel {
+    background: #eceff1;
+    color: #333;
+  }
+  #confirm-ok {
+    background: #f23f42;
+    color: white;
+    font-weight: 600;
+  }
+
+  /* ---- ゴミ箱（アーカイブ） ---- */
+  #trash-section {
+    border-top: 1px solid #3a3d43;
+  }
+  #trash-toggle {
+    width: 100%;
+    background: none;
+    border: none;
+    color: #9a9ea3;
+    font-size: 12px;
+    padding: 10px 14px;
+    text-align: left;
+    cursor: pointer;
+  }
+  #trash-toggle:hover { color: white; }
+  #trash-list {
+    list-style: none;
+    margin: 0;
+    padding: 0 8px 8px;
+    max-height: 160px;
+    overflow-y: auto;
+    display: none;
+  }
+  #trash-list.open { display: block; }
+  #trash-list li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    color: #9a9ea3;
+  }
+  #trash-list li:hover { background: #3a3d43; }
+  #trash-list .trash-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  #trash-list .trash-days {
+    font-size: 10px;
+    color: #71767a;
+    flex-shrink: 0;
+  }
+  #trash-list .trash-actions {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  #trash-list button {
+    background: none;
+    border: none;
+    color: #06c755;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 2px 4px;
+  }
+  #trash-list button.purge {
+    color: #f23f42;
+  }
+  #trash-empty {
+    padding: 6px 14px 10px;
+    font-size: 11px;
+    color: #71767a;
+  }
 </style>
 </head>
 <body>
@@ -247,10 +404,13 @@
   <h1>G&amp;C Chat — ルーム</h1>
   <ul id="room-list">
     {% for r in rooms %}
-      <li>
+      <li data-room-item="{{ r.id }}">
         <a href="{{ url_for('room_view', room_id=r.id) }}"
-           class="{{ 'active' if current_room and current_room.id == r.id else '' }}">
-          # {{ r.name }}
+           class="{{ 'active' if current_room and current_room.id == r.id else '' }}"
+           data-room-id="{{ r.id }}"
+           data-room-name="{{ r.name }}">
+          <span class="room-label"># {{ r.name }}</span>
+          <input type="text" class="room-rename-input" value="{{ r.name }}" maxlength="40" style="display:none">
         </a>
       </li>
     {% endfor %}
@@ -260,6 +420,26 @@
       <input type="text" name="name" placeholder="新しい話題名" required maxlength="40">
       <button type="submit">＋</button>
     </form>
+  </div>
+
+  <div id="trash-section">
+    <button id="trash-toggle" type="button">🗑 ゴミ箱（{{ archived_rooms|length }}）</button>
+    <ul id="trash-list">
+      {% if archived_rooms %}
+        {% for r in archived_rooms %}
+          <li data-archived-room-id="{{ r.id }}">
+            <span class="trash-name" title="{{ r.name }}"># {{ r.name }}</span>
+            <span class="trash-days">残り{{ r.days_left }}日</span>
+            <span class="trash-actions">
+              <button type="button" class="restore" title="復元">復元</button>
+              <button type="button" class="purge" title="完全削除">完全削除</button>
+            </span>
+          </li>
+        {% endfor %}
+      {% else %}
+        <li id="trash-empty">ゴミ箱は空です</li>
+      {% endif %}
+    </ul>
   </div>
 </div>
 
@@ -298,9 +478,190 @@
   {% endif %}
 </div>
 
+<div id="room-context-menu">
+  <button id="ctx-rename">名前を変更</button>
+  <button id="ctx-delete" class="danger">ルームを削除</button>
+</div>
+
+<div id="confirm-modal">
+  <div class="box">
+    <p id="confirm-message"></p>
+    <div class="actions">
+      <button id="confirm-cancel">キャンセル</button>
+      <button id="confirm-ok">削除する</button>
+    </div>
+  </div>
+</div>
+
 <script>
   const chat = document.getElementById('chat');
   if (chat) chat.scrollTop = chat.scrollHeight;
+
+  const menu = document.getElementById('room-context-menu');
+  const renameBtn = document.getElementById('ctx-rename');
+  const deleteBtn = document.getElementById('ctx-delete');
+  let targetRoomId = null;
+  let targetRoomName = null;
+
+  function hideMenu() {
+    menu.style.display = 'none';
+    targetRoomId = null;
+    targetRoomName = null;
+  }
+
+  document.querySelectorAll('#room-list a').forEach((link) => {
+    link.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      targetRoomId = link.dataset.roomId;
+      targetRoomName = link.dataset.roomName;
+      menu.style.display = 'block';
+      const menuWidth = 150;
+      const menuHeight = 80;
+      let x = e.clientX;
+      let y = e.clientY;
+      if (x + menuWidth > window.innerWidth) x = window.innerWidth - menuWidth - 8;
+      if (y + menuHeight > window.innerHeight) y = window.innerHeight - menuHeight - 8;
+      menu.style.left = x + 'px';
+      menu.style.top = y + 'px';
+    });
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!menu.contains(e.target)) hideMenu();
+  });
+  document.addEventListener('scroll', hideMenu, true);
+
+  renameBtn.addEventListener('click', () => {
+    if (!targetRoomId) return;
+    const roomId = targetRoomId;
+    const li = document.querySelector(`li[data-room-item="${roomId}"]`);
+    hideMenu();
+    if (!li) return;
+    const label = li.querySelector('.room-label');
+    const input = li.querySelector('.room-rename-input');
+    const link = li.querySelector('a');
+    link.style.pointerEvents = 'none';
+    label.style.display = 'none';
+    input.style.display = 'block';
+    input.value = link.dataset.roomName;
+    input.focus();
+    input.select();
+
+    const commit = async () => {
+      input.removeEventListener('blur', commit);
+      const newName = input.value.trim();
+      link.style.pointerEvents = '';
+      if (!newName || newName === link.dataset.roomName) {
+        input.style.display = 'none';
+        label.style.display = '';
+        return;
+      }
+      const res = await fetch(`/rooms/${roomId}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'name=' + encodeURIComponent(newName),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        location.reload();
+      } else {
+        alert(data.error || '名前の変更に失敗しました');
+        input.style.display = 'none';
+        label.style.display = '';
+      }
+    };
+
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+      if (e.key === 'Escape') {
+        input.removeEventListener('blur', commit);
+        link.style.pointerEvents = '';
+        input.style.display = 'none';
+        label.style.display = '';
+      }
+    });
+  });
+
+  const confirmModal = document.getElementById('confirm-modal');
+  const confirmMessage = document.getElementById('confirm-message');
+  const confirmOk = document.getElementById('confirm-ok');
+  const confirmCancel = document.getElementById('confirm-cancel');
+
+  function askConfirm(message) {
+    return new Promise((resolve) => {
+      confirmMessage.textContent = message;
+      confirmModal.style.display = 'flex';
+      const cleanup = (result) => {
+        confirmModal.style.display = 'none';
+        confirmOk.removeEventListener('click', onOk);
+        confirmCancel.removeEventListener('click', onCancel);
+        resolve(result);
+      };
+      const onOk = () => cleanup(true);
+      const onCancel = () => cleanup(false);
+      confirmOk.addEventListener('click', onOk);
+      confirmCancel.addEventListener('click', onCancel);
+    });
+  }
+
+  deleteBtn.addEventListener('click', async () => {
+    if (!targetRoomId) return;
+    const roomIdToDelete = targetRoomId;
+    const roomName = targetRoomName;
+    hideMenu();
+    const confirmed = await askConfirm(`「${roomName}」をゴミ箱に移します。30日以内なら復元できます。よろしいですか？`);
+    if (!confirmed) return;
+    const res = await fetch(`/rooms/${roomIdToDelete}/delete`, { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      const viewingDeletedRoom = String(roomIdToDelete) === String({{ current_room.id if current_room else 'null' }});
+      if (!viewingDeletedRoom) {
+        location.reload();
+      } else if (data.next_room_id) {
+        location.href = `/rooms/${data.next_room_id}`;
+      } else {
+        location.href = '/rooms';
+      }
+    } else {
+      alert(data.error || '削除に失敗しました');
+    }
+  });
+
+  const trashToggle = document.getElementById('trash-toggle');
+  const trashList = document.getElementById('trash-list');
+  trashToggle.addEventListener('click', () => {
+    trashList.classList.toggle('open');
+  });
+
+  trashList.addEventListener('click', async (e) => {
+    const li = e.target.closest('li[data-archived-room-id]');
+    if (!li) return;
+    const roomId = li.dataset.archivedRoomId;
+    const roomName = li.querySelector('.trash-name').textContent.replace(/^#\s*/, '');
+
+    if (e.target.classList.contains('restore')) {
+      const res = await fetch(`/rooms/${roomId}/restore`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        location.href = `/rooms/${data.room_id}`;
+      } else {
+        alert(data.error || '復元に失敗しました');
+      }
+    }
+
+    if (e.target.classList.contains('purge')) {
+      const confirmed = await askConfirm(`「${roomName}」を完全に削除します。この操作は取り消せません。よろしいですか？`);
+      if (!confirmed) return;
+      const res = await fetch(`/rooms/${roomId}/purge`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        location.reload();
+      } else {
+        alert(data.error || '完全削除に失敗しました');
+      }
+    }
+  });
 </script>
 </body>
 </html>
