@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+
+# 会話データ（個人のログ）はコードと分けて追跡しない
+gcc_chat.db
+logs/
+dialogue_log.md
