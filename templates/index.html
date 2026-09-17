@@ -123,6 +123,10 @@
     font-size: 16px;
     box-shadow: 0 1px 4px rgba(0,0,0,0.15);
     flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
   }
   header small {
     display: block;
@@ -130,6 +134,79 @@
     font-size: 12px;
     opacity: 0.85;
     margin-top: 2px;
+  }
+  #capture-btn {
+    flex-shrink: 0;
+    background: rgba(255,255,255,0.18);
+    color: white;
+    border: 1px solid rgba(255,255,255,0.4);
+    padding: 7px 14px;
+    border-radius: 16px;
+    font-size: 12.5px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  #capture-btn:hover { background: rgba(255,255,255,0.3); }
+  #capture-status {
+    padding: 8px 16px 0;
+    font-size: 12.5px;
+    color: #b3261e;
+    display: none;
+  }
+  #capture-status.show { display: block; }
+  #capture-status .actions {
+    margin-top: 4px;
+    display: flex;
+    gap: 8px;
+  }
+  #capture-status button {
+    border: none;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    background: #eceff1;
+  }
+  .copy-btn {
+    border: none;
+    background: none;
+    color: inherit;
+    opacity: 0.7;
+    font-size: 10px;
+    cursor: pointer;
+    margin-left: 6px;
+  }
+  .copy-btn:hover { opacity: 1; text-decoration: underline; }
+  #import-share-box {
+    flex-shrink: 0;
+    padding: 8px 16px;
+    background: #f4f5f7;
+    border-top: 1px solid #e2e4e8;
+    font-size: 12.5px;
+  }
+  #import-share-box summary {
+    cursor: pointer;
+    color: var(--text-muted);
+  }
+  #import-share-box textarea {
+    width: 100%;
+    min-height: 60px;
+    margin-top: 8px;
+    border: 1px solid #d8dbe0;
+    border-radius: 8px;
+    padding: 8px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  #import-share-btn {
+    margin-top: 6px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 14px;
+    font-size: 12.5px;
+    cursor: pointer;
   }
   #chat {
     flex: 1;
@@ -446,9 +523,14 @@
 <div id="main">
   {% if current_room %}
     <header>
-      # {{ current_room.name }}
-      <small>Gemini（ブラウザAI）と Claude Code の会話ログ — 送信は常に手動コピペ</small>
+      <div>
+        # {{ current_room.name }}
+        <small>Gemini（ブラウザAI）と Claude Code の会話ログ — 送信は常に手動コピペ</small>
+      </div>
+      <button id="capture-btn" type="button" data-room-id="{{ current_room.id }}">⬇ Geminiから取り込む</button>
     </header>
+
+    <div id="capture-status"></div>
 
     <div id="chat">
       {% if not messages %}
@@ -456,12 +538,23 @@
       {% endif %}
       {% for m in messages %}
         <div class="row {{ 'gemini' if m.speaker == 'Gemini' else 'claude' }}">
-          <div class="label">{{ m.speaker }}</div>
+          <div class="label">{{ m.speaker }}{% if m.imported %} ・ インポート{% endif %}</div>
           <div class="bubble">{{ m.body }}</div>
-          <div class="timestamp">{{ m.created_at }}</div>
+          <div class="timestamp">
+            {{ m.created_at }}
+            {% if m.speaker == 'Claude' %}
+              <button class="copy-btn" type="button" data-message-id="{{ m.id }}">📋 Gemini用にコピー</button>
+            {% endif %}
+          </div>
         </div>
       {% endfor %}
     </div>
+
+    <details id="import-share-box">
+      <summary>GCC導入前の会話をインポート（共有ページの全文を貼り付け）</summary>
+      <textarea id="import-share-text" placeholder="Gemini等の共有ページを開いて全文コピーし、ここに貼り付けてください"></textarea>
+      <button id="import-share-btn" type="button" data-room-id="{{ current_room.id }}">インポートする</button>
+    </details>
 
     <div id="composer">
       <form method="post" action="{{ url_for('add_message', room_id=current_room.id) }}" id="add-form">
@@ -662,6 +755,97 @@
       }
     }
   });
+
+  const captureBtn = document.getElementById('capture-btn');
+  const captureStatus = document.getElementById('capture-status');
+
+  function showCaptureStatus(message, actionsHtml) {
+    captureStatus.innerHTML = message + (actionsHtml ? `<div class="actions">${actionsHtml}</div>` : '');
+    captureStatus.classList.add('show');
+  }
+  function hideCaptureStatus() {
+    captureStatus.classList.remove('show');
+    captureStatus.innerHTML = '';
+  }
+
+  async function runCapture(roomId, force) {
+    captureBtn.disabled = true;
+    captureBtn.textContent = '⏳ 取り込み中…';
+    try {
+      const res = await fetch(`/rooms/${roomId}/capture-now`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force: !!force }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        hideCaptureStatus();
+        location.reload();
+        return;
+      }
+      if (data.code === 'duplicate') {
+        showCaptureStatus('すでに同じ内容を記録済みです（新しい発言はまだ無いようです）。');
+      } else if (data.code === 'different_session') {
+        showCaptureStatus(
+          data.error,
+          `<button id="force-capture-btn">それでも取り込む</button><button id="dismiss-capture-btn">無視する</button>`
+        );
+        document.getElementById('force-capture-btn').addEventListener('click', () => runCapture(roomId, true));
+        document.getElementById('dismiss-capture-btn').addEventListener('click', hideCaptureStatus);
+      } else {
+        showCaptureStatus(data.error || '取り込みに失敗しました。');
+      }
+    } catch (err) {
+      showCaptureStatus('取り込み中にエラーが発生しました: ' + err.message);
+    } finally {
+      captureBtn.disabled = false;
+      captureBtn.textContent = '⬇ Geminiから取り込む';
+    }
+  }
+
+  if (captureBtn) {
+    captureBtn.addEventListener('click', () => runCapture(captureBtn.dataset.roomId, false));
+  }
+
+  document.querySelectorAll('.copy-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const messageId = btn.dataset.messageId;
+      const roomId = {{ current_room.id if current_room else 'null' }};
+      const res = await fetch(`/rooms/${roomId}/messages/${messageId}/copy-text`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        try {
+          await navigator.clipboard.writeText(data.text);
+          btn.textContent = '✅ コピーしました';
+          setTimeout(() => { btn.textContent = '📋 Gemini用にコピー'; }, 1500);
+        } catch {
+          prompt('コピーできませんでした。手動で選択してコピーしてください:', data.text);
+        }
+      } else {
+        alert(data.error || 'コピーに失敗しました');
+      }
+    });
+  });
+
+  const importBtn = document.getElementById('import-share-btn');
+  if (importBtn) {
+    importBtn.addEventListener('click', async () => {
+      const textarea = document.getElementById('import-share-text');
+      const text = textarea.value.trim();
+      if (!text) return;
+      const res = await fetch(`/rooms/${importBtn.dataset.roomId}/import-share`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        location.reload();
+      } else {
+        alert(data.error || 'インポートに失敗しました');
+      }
+    });
+  }
 </script>
 </body>
 </html>

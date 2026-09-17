@@ -8,6 +8,56 @@ from pathlib import Path
 
 from flask import Flask, render_template, request, redirect, url_for, abort, g, jsonify
 
+CDP_URL = os.environ.get("GCC_CHROME_CDP_URL", "http://localhost:9222")
+
+
+def extract_latest_gemini_message() -> dict:
+    """専用Chrome（デバッグポート接続）から、Geminiタブの最新のAI発言を抽出する。
+
+    戻り値: {"ok": True, "text": ..., "source_url": ...} または {"ok": False, "error": ...}
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {"ok": False, "error": "playwrightがインストールされていません（pip install playwright）"}
+
+    try:
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.connect_over_cdp(CDP_URL)
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": (
+                        "専用Chromeに接続できません。launch_gemini_chrome.sh で"
+                        "デバッグポート付きのChromeを起動してから試してください。"
+                    ),
+                }
+            gemini_pages = [
+                pg for ctx in browser.contexts for pg in ctx.pages if "gemini.google.com" in pg.url
+            ]
+            if not gemini_pages:
+                browser.close()
+                return {"ok": False, "error": "Geminiのタブが見つかりません。専用Chromeでgemini.google.comを開いてください。"}
+
+            page = gemini_pages[0]
+            model_msgs = page.query_selector_all("model-response")
+            if not model_msgs:
+                browser.close()
+                return {"ok": False, "error": "AI発言のブロックが見つかりませんでした。ページ構造が変わった可能性があります。"}
+
+            last = model_msgs[-1]
+            content = last.query_selector("message-content")
+            text = (content.inner_text() if content else last.inner_text()).strip()
+            source_url = page.url
+            browser.close()
+
+            if not text:
+                return {"ok": False, "error": "抽出したテキストが空でした。"}
+            return {"ok": True, "text": text, "source_url": source_url}
+    except Exception as exc:
+        return {"ok": False, "error": f"抽出中にエラーが発生しました: {exc}"}
+
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent
@@ -23,6 +73,14 @@ SLUG_RE = re.compile(r"[^a-zA-Z0-9\-_]+")
 # 削除したルームをゴミ箱に保管しておく日数。この日数を過ぎると自動で完全削除される。
 ARCHIVE_DAYS = 30
 TIMESTAMP_FMT = "%Y-%m-%d %H:%M"
+
+# 相手のAIに「これはGCC Chat経由の中継である」と伝えるための注釈。
+# ルームごとに初回の相手向けメッセージにのみ自動で付与する。
+GCC_EXPLAINER = (
+    "（この会話はG&C Chatというローカルログアプリを介して、"
+    "別のAI/セッションとの間で人間が手動中継しています。"
+    "これは会話の一部として記録・共有されることを前提にしています。）\n\n"
+)
 
 
 def make_room_slug(room_id: int, name: str) -> str:
@@ -72,14 +130,26 @@ def init_db() -> None:
             room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
             speaker TEXT NOT NULL CHECK (speaker IN ('Gemini', 'Claude')),
             body TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            source_url TEXT,
+            imported INTEGER NOT NULL DEFAULT 0
         )
         """
     )
-    # 既存DBに deleted_at カラムがなければ追加する（旧バージョンからの移行）
-    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(rooms)")}
-    if "deleted_at" not in existing_cols:
+    # 既存DBへのカラム追加（旧バージョンからの移行）
+    room_cols = {row[1] for row in conn.execute("PRAGMA table_info(rooms)")}
+    if "deleted_at" not in room_cols:
         conn.execute("ALTER TABLE rooms ADD COLUMN deleted_at TEXT")
+    if "last_gemini_url" not in room_cols:
+        conn.execute("ALTER TABLE rooms ADD COLUMN last_gemini_url TEXT")
+    if "explainer_sent" not in room_cols:
+        conn.execute("ALTER TABLE rooms ADD COLUMN explainer_sent INTEGER NOT NULL DEFAULT 0")
+
+    msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "source_url" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN source_url TEXT")
+    if "imported" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN imported INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
     cur = conn.execute("SELECT COUNT(*) FROM rooms")
@@ -284,6 +354,137 @@ def restore_room(room_id: int):
     db.execute("UPDATE rooms SET deleted_at = NULL WHERE id = ?", (room_id,))
     db.commit()
     return jsonify({"ok": True, "room_id": room_id})
+
+
+@app.route("/rooms/<int:room_id>/messages/<int:message_id>/copy-text", methods=["POST"])
+def copy_text_for_gemini(room_id: int, message_id: int):
+    """Claudeの発言をGeminiへの貼り付け用に整形して返す。
+
+    このルームでまだ相手に一度もGCC経由だと伝えていなければ、
+    GCC_EXPLAINERを本文の先頭に自動で付け、以後は付けない。
+    """
+    db = get_db()
+    room = get_room_or_404(db, room_id)
+    message = db.execute(
+        "SELECT * FROM messages WHERE id = ? AND room_id = ? AND speaker = 'Claude'",
+        (message_id, room_id),
+    ).fetchone()
+    if message is None:
+        return jsonify({"ok": False, "error": "メッセージが見つかりません"}), 404
+
+    text = message["body"]
+    if not room["explainer_sent"]:
+        text = GCC_EXPLAINER + text
+        db.execute("UPDATE rooms SET explainer_sent = 1 WHERE id = ?", (room_id,))
+        db.commit()
+
+    return jsonify({"ok": True, "text": text})
+
+
+def do_capture(room_id: int, text: str, source_url: str | None, force: bool) -> tuple[dict, int]:
+    """captureの中核ロジック。(レスポンス用dict, HTTPステータス)を返す。
+
+    重複（前回と同一本文）や別セッションの疑い（source_urlが前回と違う）を検知し、
+    force=Trueが来ない限りは確認を求めるレスポンスを返す。
+    """
+    db = get_db()
+    room = get_room_or_404(db, room_id)
+    text = (text or "").strip()
+    source_url = (source_url or "").strip() or None
+
+    if not text:
+        return {"ok": False, "error": "取得したテキストが空です"}, 400
+
+    last_gemini = db.execute(
+        "SELECT * FROM messages WHERE room_id = ? AND speaker = 'Gemini' "
+        "ORDER BY id DESC LIMIT 1",
+        (room_id,),
+    ).fetchone()
+
+    if not force and last_gemini and last_gemini["body"].strip() == text:
+        return {
+            "ok": False,
+            "code": "duplicate",
+            "error": "前回記録したGemini発言と同じ内容です。すでに取り込み済みの可能性があります。",
+        }, 409
+
+    if (
+        not force
+        and source_url
+        and room["last_gemini_url"]
+        and room["last_gemini_url"] != source_url
+    ):
+        return {
+            "ok": False,
+            "code": "different_session",
+            "error": (
+                "前回このルームに記録した時と、GeminiのURL（会話ID）が異なります。"
+                "別のGemini会話から取得しようとしている可能性があります。"
+            ),
+        }, 409
+
+    timestamp = datetime.now().strftime(TIMESTAMP_FMT)
+    db.execute(
+        "INSERT INTO messages (room_id, speaker, body, created_at, source_url) "
+        "VALUES (?, 'Gemini', ?, ?, ?)",
+        (room_id, text, timestamp, source_url),
+    )
+    if source_url:
+        db.execute("UPDATE rooms SET last_gemini_url = ? WHERE id = ?", (source_url, room_id))
+    db.commit()
+    append_to_room_log(room["name"], room["slug"], "Gemini", text, timestamp)
+    return {"ok": True}, 200
+
+
+@app.route("/rooms/<int:room_id>/capture", methods=["POST"])
+def capture_message(room_id: int):
+    """ブラウザ拡張/クライアント側ですでに抽出済みのテキストを取り込む。"""
+    payload = request.get_json(silent=True) or {}
+    result, status = do_capture(
+        room_id, payload.get("text"), payload.get("source_url"), bool(payload.get("force"))
+    )
+    return jsonify(result), status
+
+
+@app.route("/rooms/<int:room_id>/capture-now", methods=["POST"])
+def capture_now(room_id: int):
+    """専用Chromeから今すぐGeminiの最新発言を抽出し、そのまま/captureのロジックに渡す。"""
+    get_room_or_404(get_db(), room_id)
+    force = bool((request.get_json(silent=True) or {}).get("force"))
+
+    extracted = extract_latest_gemini_message()
+    if not extracted["ok"]:
+        return jsonify(extracted), 400
+
+    result, status = do_capture(room_id, extracted["text"], extracted["source_url"], force)
+    return jsonify(result), status
+
+
+@app.route("/rooms/<int:room_id>/import-share", methods=["POST"])
+def import_share(room_id: int):
+    """GCC導入前の会話を、共有リンクの中身（貼り付けたテキスト）で一括インポートする。
+
+    Gemini/claude.aiの共有ページはクライアント側で描画されるSPAのため、
+    サーバー側から自動取得しても中身が空になることが多い。
+    そのため確実性を優先し、ユーザーが共有ページを開いて全文コピペしたテキストを
+    そのまま「導入前の文脈」として1件にまとめて記録する。
+    """
+    db = get_db()
+    room = get_room_or_404(db, room_id)
+    text = (request.get_json(silent=True) or {}).get("text", "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "インポートするテキストが空です"}), 400
+
+    timestamp = datetime.now().strftime(TIMESTAMP_FMT)
+    body = "【GCC導入前の会話をインポート】\n\n" + text
+    db.execute(
+        "INSERT INTO messages (room_id, speaker, body, created_at, imported) "
+        "VALUES (?, 'Gemini', ?, ?, 1)",
+        (room_id, body, timestamp),
+    )
+    db.commit()
+    append_to_room_log(room["name"], room["slug"], "Gemini", body, timestamp)
+    return jsonify({"ok": True})
 
 
 @app.route("/rooms/<int:room_id>/purge", methods=["POST"])
