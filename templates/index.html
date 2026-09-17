@@ -135,7 +135,12 @@
     opacity: 0.85;
     margin-top: 2px;
   }
-  #capture-btn {
+  .header-actions {
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  #capture-btn, #handoff-btn {
     flex-shrink: 0;
     background: rgba(255,255,255,0.18);
     color: white;
@@ -146,7 +151,69 @@
     cursor: pointer;
     white-space: nowrap;
   }
-  #capture-btn:hover { background: rgba(255,255,255,0.3); }
+  #capture-btn:hover, #handoff-btn:hover { background: rgba(255,255,255,0.3); }
+  #handoff-status {
+    padding: 0 16px;
+    font-size: 12.5px;
+    color: #2e7d32;
+    display: none;
+  }
+  #handoff-status.show { display: block; padding: 8px 16px 0; }
+  #handoff-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.4);
+    z-index: 2000;
+    align-items: center;
+    justify-content: center;
+  }
+  #handoff-modal.show { display: flex; }
+  #handoff-modal .box {
+    background: white;
+    border-radius: 10px;
+    padding: 20px;
+    width: 340px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  }
+  #handoff-modal h3 {
+    margin: 0 0 12px;
+    font-size: 15px;
+    color: #222;
+  }
+  #handoff-modal label {
+    display: block;
+    font-size: 12.5px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+  #handoff-modal input {
+    width: 100%;
+    border: 1px solid #d8dbe0;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13.5px;
+    margin-bottom: 14px;
+  }
+  #handoff-modal .hint {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    margin: -8px 0 14px;
+  }
+  #handoff-modal .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  #handoff-modal button {
+    border: none;
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #handoff-cancel { background: #eceff1; color: #333; }
+  #handoff-submit { background: var(--accent); color: white; font-weight: 600; }
   #capture-status {
     padding: 8px 16px 0;
     font-size: 12.5px;
@@ -527,10 +594,14 @@
         # {{ current_room.name }}
         <small>Gemini（ブラウザAI）と Claude Code の会話ログ — 送信は常に手動コピペ</small>
       </div>
-      <button id="capture-btn" type="button" data-room-id="{{ current_room.id }}">⬇ Geminiから取り込む</button>
+      <div class="header-actions">
+        <button id="capture-btn" type="button" data-room-id="{{ current_room.id }}">⬇ Geminiから取り込む</button>
+        <button id="handoff-btn" type="button" data-room-id="{{ current_room.id }}">📤 他セッションへ送る</button>
+      </div>
     </header>
 
     <div id="capture-status"></div>
+    <div id="handoff-status"></div>
 
     <div id="chat">
       {% if not messages %}
@@ -582,6 +653,19 @@
     <div class="actions">
       <button id="confirm-cancel">キャンセル</button>
       <button id="confirm-ok">削除する</button>
+    </div>
+  </div>
+</div>
+
+<div id="handoff-modal">
+  <div class="box">
+    <h3>他セッションへ送る</h3>
+    <label for="handoff-target">送信先ラベル</label>
+    <input type="text" id="handoff-target" placeholder="例: このセッション / trading-bot-cli" maxlength="60">
+    <div class="hint">受け取る側は同じラベルで <code>mailbox_check.py --target "ラベル名"</code> を実行するか、GETで <code>/handoffs?target=ラベル名</code> を確認してください。内容は自動でルームの全ログになります。</div>
+    <div class="actions">
+      <button id="handoff-cancel">キャンセル</button>
+      <button id="handoff-submit">送る</button>
     </div>
   </div>
 </div>
@@ -843,6 +927,40 @@
         location.reload();
       } else {
         alert(data.error || 'インポートに失敗しました');
+      }
+    });
+  }
+
+  const handoffBtn = document.getElementById('handoff-btn');
+  const handoffModal = document.getElementById('handoff-modal');
+  const handoffTarget = document.getElementById('handoff-target');
+  const handoffCancel = document.getElementById('handoff-cancel');
+  const handoffSubmit = document.getElementById('handoff-submit');
+  const handoffStatus = document.getElementById('handoff-status');
+
+  if (handoffBtn) {
+    handoffBtn.addEventListener('click', () => {
+      handoffTarget.value = '';
+      handoffModal.classList.add('show');
+      handoffTarget.focus();
+    });
+    handoffCancel.addEventListener('click', () => handoffModal.classList.remove('show'));
+    handoffSubmit.addEventListener('click', async () => {
+      const label = handoffTarget.value.trim();
+      if (!label) return;
+      const res = await fetch(`/rooms/${handoffBtn.dataset.roomId}/handoffs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_label: label }),
+      });
+      const data = await res.json();
+      handoffModal.classList.remove('show');
+      if (data.ok) {
+        handoffStatus.textContent = `「${label}」宛に送りました。受け取り側は mailbox_check.py --target "${label}" で確認できます。`;
+        handoffStatus.classList.add('show');
+        setTimeout(() => handoffStatus.classList.remove('show'), 6000);
+      } else {
+        alert(data.error || '送信に失敗しました');
       }
     });
   }

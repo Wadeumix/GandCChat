@@ -150,6 +150,19 @@ def init_db() -> None:
         conn.execute("ALTER TABLE messages ADD COLUMN source_url TEXT")
     if "imported" not in msg_cols:
         conn.execute("ALTER TABLE messages ADD COLUMN imported INTEGER NOT NULL DEFAULT 0")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS handoffs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+            target_label TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            consumed_at TEXT
+        )
+        """
+    )
     conn.commit()
 
     cur = conn.execute("SELECT COUNT(*) FROM rooms")
@@ -484,6 +497,72 @@ def import_share(room_id: int):
     )
     db.commit()
     append_to_room_log(room["name"], room["slug"], "Gemini", body, timestamp)
+    return jsonify({"ok": True})
+
+
+@app.route("/rooms/<int:room_id>/handoffs", methods=["POST"])
+def create_handoff(room_id: int):
+    """このルームの内容を、指定したラベルのセッション宛てにメールボックスへ積む。
+
+    target_labelは自由文字列（例: "このセッション", "trading-bot-cli"）。
+    contentが指定されなければ、ルームの全ログを渡す。
+    """
+    db = get_db()
+    room = get_room_or_404(db, room_id)
+    payload = request.get_json(silent=True) or {}
+    target_label = (payload.get("target_label") or "").strip()
+    content = (payload.get("content") or "").strip()
+
+    if not target_label:
+        return jsonify({"ok": False, "error": "送信先ラベルが空です"}), 400
+
+    if not content:
+        messages = db.execute(
+            "SELECT * FROM messages WHERE room_id = ? ORDER BY id ASC", (room_id,)
+        ).fetchall()
+        lines = [f"# {room['name']}（G&C Chatより中継）\n"]
+        for m in messages:
+            lines.append(f"## {m['speaker']}（{m['created_at']}）\n\n{m['body']}\n")
+        content = "\n".join(lines)
+
+    timestamp = datetime.now().strftime(TIMESTAMP_FMT)
+    db.execute(
+        "INSERT INTO handoffs (room_id, target_label, content, created_at) VALUES (?, ?, ?, ?)",
+        (room_id, target_label, content, timestamp),
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/handoffs", methods=["GET"])
+def list_handoffs():
+    """target指定で自分宛の未受信分を取得する。status=allで受信済みも含める。"""
+    db = get_db()
+    target = request.args.get("target", "").strip()
+    status = request.args.get("status", "pending")
+    if not target:
+        return jsonify({"ok": False, "error": "targetクエリパラメータが必要です"}), 400
+
+    query = "SELECT h.*, r.name AS room_name FROM handoffs h JOIN rooms r ON r.id = h.room_id WHERE h.target_label = ?"
+    params = [target]
+    if status == "pending":
+        query += " AND h.consumed_at IS NULL"
+    query += " ORDER BY h.id ASC"
+
+    rows = db.execute(query, params).fetchall()
+    return jsonify({"ok": True, "handoffs": [dict(r) for r in rows]})
+
+
+@app.route("/handoffs/<int:handoff_id>/ack", methods=["POST"])
+def ack_handoff(handoff_id: int):
+    """受信済みにマークする。"""
+    db = get_db()
+    handoff = db.execute("SELECT * FROM handoffs WHERE id = ?", (handoff_id,)).fetchone()
+    if handoff is None:
+        return jsonify({"ok": False, "error": "見つかりません"}), 404
+    timestamp = datetime.now().strftime(TIMESTAMP_FMT)
+    db.execute("UPDATE handoffs SET consumed_at = ? WHERE id = ?", (timestamp, handoff_id))
+    db.commit()
     return jsonify({"ok": True})
 
 

@@ -90,11 +90,38 @@ python app.py
 - 前回と異なるGemini会話（別のURL）から取り込もうとすると警告が出ます。意図した動作なら「それでも取り込む」を選んでください
 - `--remote-debugging-port`は同一マシン上の他プロセスからも接続できてしまうため、**専用プロファイルを分離**することで普段使いのChromeへの影響を防いでいます
 
+## 他セッションへの受け渡し（メールボックス方式）
+
+「このルームのログを、どのClaude Codeセッションに渡すか」を、送信先を自由なラベル文字列で指定して受け渡せます。今この会話をしているセッションでも、別のターミナルで動いているCLIプロセスでも同じ仕組みで扱えます。
+
+### 送る側（GCC Chat側）
+
+1. ルーム画面右上の「📤 他セッションへ送る」を押す
+2. 送信先ラベル（例:「このセッション」「trading-bot-cli」など好きな名前）を入力して送る
+3. 内容は自動でそのルームの全ログになる
+
+### 受け取る側
+
+同じラベルを指定して、以下のどちらかで確認します。
+
+```bash
+python3 mailbox_check.py --target "trading-bot-cli"
+```
+
+または直接API:
+
+```bash
+curl "http://127.0.0.1:5050/handoffs?target=trading-bot-cli"
+```
+
+未読分だけが返り、取得後に既読にしたい場合は `--ack` オプション（APIなら`POST /handoffs/<id>/ack`）を使います。**常時ポーリングはしない**設計なので、必要な時に都度実行してください。「今の会話をしているセッション」宛てに送られたものは、そのセッション自身が同じAPIを叩けば確認できます。
+
 ## データ構造
 
 ```
 rooms(id, name, slug, created_at, deleted_at, last_gemini_url, explainer_sent)
 messages(id, room_id, speaker, body, created_at, source_url, imported)
+handoffs(id, room_id, target_label, content, created_at, consumed_at)
 ```
 
 `messages.room_id` は `rooms.id` を参照し、ルーム削除時は関連メッセージも削除されます（`ON DELETE CASCADE`）。ただしルーム削除機能自体は現時点でUIに未実装です。
