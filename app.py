@@ -464,6 +464,24 @@ def copy_text_for_gemini(room_id: int, message_id: int):
     return jsonify({"ok": True, "text": text})
 
 
+@app.route("/rooms/<int:room_id>/link-prompt", methods=["GET"])
+def link_prompt(room_id: int):
+    """Claude Codeにそのまま貼り付けられる、ログファイルへの案内プロンプトを返す。
+
+    ラベルの受け渡しのような取り決めを不要にし、
+    「このパスのログを読んで続きをやって」という一文だけで済むようにする。
+    """
+    db = get_db()
+    room = get_room_or_404(db, room_id)
+    log_path = room_log_path(room["slug"]).resolve()
+    prompt = (
+        f"G&C Chatというローカルログアプリの「{room['name']}」ルームの会話ログです。\n"
+        f"以下のファイルを読んで、これまでの文脈を踏まえた上で続きを行ってください。\n\n"
+        f"{log_path}\n"
+    )
+    return jsonify({"ok": True, "prompt": prompt, "path": str(log_path)})
+
+
 def do_capture(room_id: int, text: str, source_url: str | None, force: bool) -> tuple[dict, int]:
     """captureの中核ロジック。(レスポンス用dict, HTTPステータス)を返す。
 
