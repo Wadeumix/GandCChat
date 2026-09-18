@@ -6,3 +6,7 @@ __pycache__/
 gcc_chat.db
 logs/
 dialogue_log.md
+
+# PyInstallerのビルド生成物（.specはコミットする）
+build/
+dist/

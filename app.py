@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 import urllib.request
 from datetime import datetime, timedelta
@@ -12,8 +13,14 @@ from pathlib import Path
 
 from flask import Flask, render_template, request, redirect, url_for, abort, g, jsonify
 
+# PyInstallerでバンドルすると__file__は起動のたびに変わる一時展開先になるため、
+# gcc_post.py・launch_gemini_chrome.shなど「ソース一式が並んでいる場所」の案内には使えない。
+# GCC_SOURCE_DIRで明示指定できるようにし、未指定時は開発時の素朴な__file__基準にフォールバックする。
+FROZEN = bool(getattr(sys, "frozen", False))
+SOURCE_DIR = Path(os.environ.get("GCC_SOURCE_DIR", str(Path(__file__).resolve().parent)))
+
 CDP_URL = os.environ.get("GCC_CHROME_CDP_URL", "http://localhost:9222")
-CHROME_LAUNCH_SCRIPT = Path(__file__).parent / "launch_gemini_chrome.sh"
+CHROME_LAUNCH_SCRIPT = SOURCE_DIR / "launch_gemini_chrome.sh"
 CHROME_BOOT_TIMEOUT_SEC = 20
 
 
@@ -130,13 +137,21 @@ def extract_latest_gemini_message() -> dict:
 
 app = Flask(__name__)
 
-BASE_DIR = Path(__file__).parent
 
-# DBの保存先。環境変数 GCC_DB_PATH で明示的に指定できる。未指定ならプロジェクト直下。
-DB_PATH = Path(os.environ.get("GCC_DB_PATH", BASE_DIR / "gcc_chat.db")).expanduser()
+def _default_data_dir() -> Path:
+    if FROZEN:
+        # アプリ化した場合は、実行のたびに消えない場所に保存する。
+        return Path.home() / "Library" / "Application Support" / "GCC Chat"
+    return SOURCE_DIR
+
+
+DATA_DIR = _default_data_dir()
+
+# DBの保存先。環境変数 GCC_DB_PATH で明示的に指定できる。
+DB_PATH = Path(os.environ.get("GCC_DB_PATH", DATA_DIR / "gcc_chat.db")).expanduser()
 
 # ルームごとの会話ログ（追記専用md）の保存先ディレクトリ。
-LOGS_DIR = Path(os.environ.get("GCC_LOGS_DIR", BASE_DIR / "logs")).expanduser()
+LOGS_DIR = Path(os.environ.get("GCC_LOGS_DIR", DATA_DIR / "logs")).expanduser()
 
 SLUG_RE = re.compile(r"[^a-zA-Z0-9\-_]+")
 
@@ -548,7 +563,7 @@ def link_prompt(room_id: int):
         room = get_room_or_404(db, room_id)
 
     log_path = room_log_path(room["slug"]).resolve()
-    post_script = (BASE_DIR / "gcc_post.py").resolve()
+    post_script = (SOURCE_DIR / "gcc_post.py").resolve()
     prompt = (
         f"G&C Chat（ローカルの会話中継アプリ）の「{room['name']}」ルームのログです。\n"
         f"以下のファイルを読んで、これまでの文脈を踏まえた上で続きを行ってください。\n\n"
